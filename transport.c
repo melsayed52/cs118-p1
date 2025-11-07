@@ -193,8 +193,8 @@ static void send_ack_only(ctx_t* c, uint16_t cur_seq_host_ignored, uint16_t ack_
     (void)cur_seq_host_ignored; // ignored on purpose
     packet p; memset(&p, 0, sizeof(p));
     uint16_t seq_for_ack =
-        (c->state==NORMAL) ? (uint16_t)(c->my_next_seq_after_syn - 1)
-                           : (uint16_t)(c->my_isn+1);
+        (c.state==NORMAL) ? c.my_next_seq_after_syn
+                          : (uint16_t)(c.my_isn+1);
     p.seq    = htons(seq_for_ack);
     p.ack    = htons(ack_host);
     p.length = htons(0);
@@ -272,14 +272,21 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
 
             // Peer window sanity
             if (pwin == 0) {
-                fprintf(stderr, "[WARN] peer sent WIN=0; keeping old=%zu\n", c.peer_win_bytes);
+                // Keep the old window if peer advertises 0.
+                // Optionally clamp to 1 to avoid total stall.
+                fprintf(stderr, "[WARN] peer sent WIN=0; keeping old=%zu (clamped)\n",
+                        c.peer_win_bytes);
+                if (c.peer_win_bytes == 0)
+                    c.peer_win_bytes = 1;  // minimal nonzero window to prevent deadlock
             } else {
+                // Use the peer's current advertised window directly.
                 if (pwin > MAX_WINDOW) {
                     fprintf(stderr, "[WARN] clamping peer WIN=%u to MAX_WINDOW=%d\n",
                             pwin, (int)MAX_WINDOW);
                     pwin = MAX_WINDOW;
                 }
-                c.peer_win_bytes = MAX(c.peer_win_bytes, pwin);
+                c.peer_win_bytes = pwin;  // update, don’t take max()
+            }
             }
 
             // --- handshake ---
@@ -392,41 +399,47 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
             }
         }
 
-        // ----- sending side -----
-        if (c.state == NORMAL) {
-            size_t avail = (c.peer_win_bytes > c.unacked_bytes)
-                               ? (c.peer_win_bytes - c.unacked_bytes) : 0;
+// ----- sending side -----
+if (c.state == NORMAL) {
+    size_t avail = (c.peer_win_bytes > c.unacked_bytes)
+                       ? (c.peer_win_bytes - c.unacked_bytes) : 0;
 
-            struct timeval now; gettimeofday(&now, NULL);
-            if (avail == 0 && c.s_head &&
-                TV_DIFF(now, c.last_stall_log) > 1000000) { // 1s heartbeat
-                fprintf(stderr, "[STALL] avail=0 unacked=%zu win=%zu head_seq=%hu\n",
-                        c.unacked_bytes, c.peer_win_bytes,
-                        ntohs(c.s_head->pkt.seq));
-                dump_sendq(c.s_head);
-                c.last_stall_log = now;
-            }
+    struct timeval now; gettimeofday(&now, NULL);
+    if (avail == 0 && c.s_head &&
+        TV_DIFF(now, c.last_stall_log) > 1000000) { // 1s heartbeat
+        fprintf(stderr, "[STALL] avail=0 unacked=%zu win=%zu head_seq=%hu\n",
+                c.unacked_bytes, c.peer_win_bytes,
+                ntohs(c.s_head->pkt.seq));
+        dump_sendq(c.s_head);
+        c.last_stall_log = now;
+    }
 
-            while (avail > 0) {
-                uint8_t inbuf[MAX_PAYLOAD];
-                ssize_t r = input_p(inbuf, MAX_PAYLOAD);
-                if (r <= 0) break;
-                size_t cap = (avail > MAX_PAYLOAD) ? MAX_PAYLOAD : avail;
-                uint16_t chunk = (uint16_t)((size_t)r > cap ? cap : (size_t)r);
+    while (avail > 0) {
+        size_t want = (avail > MAX_PAYLOAD) ? MAX_PAYLOAD : avail;
 
-                uint16_t seq_to_use = c.my_next_seq_after_syn;
-                send_data(&c, inbuf, chunk, seq_to_use, c.expected_peer_seq);
-                c.my_next_seq_after_syn++;
+        uint8_t inbuf[MAX_PAYLOAD];
+        // only read as many bytes as we can send now
+        ssize_t r = input_p(inbuf, want);
+        if (r <= 0) break;
 
-                avail = (c.peer_win_bytes > c.unacked_bytes)
-                            ? (c.peer_win_bytes - c.unacked_bytes) : 0;
+        uint16_t chunk = (uint16_t)r;  // r <= want
+        uint16_t seq_to_use = c.my_next_seq_after_syn;
 
-                fprintf(stderr, "[SEND] data seq=%hu len=%hu unacked=%zu win=%zu avail=%zu\n",
-                        seq_to_use, chunk, c.unacked_bytes, c.peer_win_bytes, avail);
-            }
-        } else if (c.state == CLIENT_START && !c.syn_sent) {
-            send_syn(&c); c.syn_sent = true;
-        }
+        send_data(&c, inbuf, chunk, seq_to_use, c.expected_peer_seq);
+        c.my_next_seq_after_syn++;
+
+        avail = (c.peer_win_bytes > c.unacked_bytes)
+                    ? (c.peer_win_bytes - c.unacked_bytes) : 0;
+
+        fprintf(stderr, "[SEND] data seq=%hu len=%hu unacked=%zu win=%zu avail=%zu\n",
+                seq_to_use, chunk, c.unacked_bytes, c.peer_win_bytes, avail);
+    }
+} else if (c.state == CLIENT_START && !c.syn_sent) {
+    send_syn(&c); c.syn_sent = true;
+}
+
+
+
 
         usleep(1000);
     }
