@@ -156,25 +156,21 @@ static rcv_node* rcv_insert(rcv_node* head, rcv_node* n, uint16_t expected) {
     n->next = cur->next; cur->next = n; return head;
 }
 
-
 static void rcv_flush(rcv_node** head, uint16_t* expected_seq,
-    void (*output_p)(uint8_t*, size_t)) {
-// First, scrub any stale nodes that are < expected (shouldn't happen now,
-// but protects against earlier runs or odd reordering)
-while (*head && (*head)->seq < *expected_seq) {
-rcv_node* old = *head; *head = (*head)->next;
-free(old);
+                      void (*output_p)(uint8_t*, size_t)) {
+    // scrub any stale nodes
+    while (*head && (*head)->seq < *expected_seq) {
+        rcv_node* old = *head; *head = (*head)->next;
+        free(old);
+    }
+    // deliver in-order data
+    while (*head && (*head)->seq == *expected_seq) {
+        output_p((*head)->data, (*head)->len);
+        rcv_node* old = *head; *head = (*head)->next;
+        (*expected_seq)++;
+        free(old);
+    }
 }
-// Then deliver in-order data
-while (*head && (*head)->seq == *expected_seq) {
-output_p((*head)->data, (*head)->len);
-rcv_node* old = *head; *head = (*head)->next;
-(*expected_seq)++;
-free(old);
-}
-}
-
-
 
 // -------- send helpers --------
 static void send_syn(ctx_t* c) {
@@ -188,13 +184,13 @@ static void send_synack(ctx_t* c, uint16_t ack_to_client) {
     send_pkt(c, &n->pkt);
 }
 
-// **** FIX 1: ACK-only packets use the most-recent data seq (non-advancing) in NORMAL
+// **** FIX 1: ACK-only packets use a non-advancing seq in NORMAL
 static void send_ack_only(ctx_t* c, uint16_t cur_seq_host_ignored, uint16_t ack_host) {
     (void)cur_seq_host_ignored; // ignored on purpose
     packet p; memset(&p, 0, sizeof(p));
     uint16_t seq_for_ack =
-        (c.state==NORMAL) ? c.my_next_seq_after_syn
-                          : (uint16_t)(c.my_isn+1);
+        (c->state == NORMAL) ? c->my_next_seq_after_syn   // non-advancing (OK)
+                             : (uint16_t)(c->my_isn + 1);
     p.seq    = htons(seq_for_ack);
     p.ack    = htons(ack_host);
     p.length = htons(0);
@@ -266,27 +262,25 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
             uint16_t pack = ntohs(pkt->ack);
             uint16_t plen = ntohs(pkt->length);
             uint16_t pwin = ntohs(pkt->win);
-            bool psyn = (pkt->flags & SYN) != 0;
-            bool packf= (pkt->flags & ACK) != 0;
+            bool     psyn = (pkt->flags & SYN) != 0;
+            bool     packf= (pkt->flags & ACK) != 0;
             (void)packf;
 
-            // Peer window sanity
+            // --- Peer window sanity ---
             if (pwin == 0) {
-                // Keep the old window if peer advertises 0.
-                // Optionally clamp to 1 to avoid total stall.
+                // Keep the old window; optionally clamp to 1 to avoid deadlock.
                 fprintf(stderr, "[WARN] peer sent WIN=0; keeping old=%zu (clamped)\n",
                         c.peer_win_bytes);
                 if (c.peer_win_bytes == 0)
-                    c.peer_win_bytes = 1;  // minimal nonzero window to prevent deadlock
+                    c.peer_win_bytes = 1;
             } else {
-                // Use the peer's current advertised window directly.
                 if (pwin > MAX_WINDOW) {
                     fprintf(stderr, "[WARN] clamping peer WIN=%u to MAX_WINDOW=%d\n",
                             pwin, (int)MAX_WINDOW);
                     pwin = MAX_WINDOW;
                 }
-                c.peer_win_bytes = pwin;  // update, don’t take max()
-            }
+                // Use the current advertised value directly (no running max).
+                c.peer_win_bytes = pwin;
             }
 
             // --- handshake ---
@@ -364,7 +358,6 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                 rcv_node* n = (rcv_node*) malloc(sizeof(rcv_node) + plen);
                 n->next = NULL; n->seq = pseq; n->len = plen;
                 memcpy(n->data, pkt->payload, plen);
-                //c.r_head = rcv_insert(c.r_head, n);
                 c.r_head = rcv_insert(c.r_head, n, c.expected_peer_seq);
 
                 if (!c.have_peer_isn) {
@@ -379,13 +372,14 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
                 fprintf(stderr, "[RCV] pseq=%hu plen=%hu expect:%hu->%hu rbuf:%zu->%zu\n",
                         pseq, plen, before, c.expected_peer_seq, rlen_before, rlen_after);
 
-                // dedicated ACK: **recent** non-advancing SEQ in NORMAL
+                // dedicated ACK: we ignore the provided seq in send_ack_only
                 uint16_t seq_for_ack =
                     (c.state==NORMAL) ? (uint16_t)(c.my_next_seq_after_syn - 1)
                                       : (uint16_t)(c.my_isn+1);
-                send_ack_only(&c, seq_for_ack, c.expected_peer_seq);
+                (void)seq_for_ack;
+                send_ack_only(&c, 0, c.expected_peer_seq);
             }
-        }
+        } // end inner recv loop
 
         // ----- retransmission timer -----
         if (c.s_head) {
@@ -399,47 +393,43 @@ void listen_loop(int sockfd, struct sockaddr_in* addr, int type,
             }
         }
 
-// ----- sending side -----
-if (c.state == NORMAL) {
-    size_t avail = (c.peer_win_bytes > c.unacked_bytes)
-                       ? (c.peer_win_bytes - c.unacked_bytes) : 0;
+        // ----- sending side -----
+        if (c.state == NORMAL) {
+            size_t avail = (c.peer_win_bytes > c.unacked_bytes)
+                               ? (c.peer_win_bytes - c.unacked_bytes) : 0;
 
-    struct timeval now; gettimeofday(&now, NULL);
-    if (avail == 0 && c.s_head &&
-        TV_DIFF(now, c.last_stall_log) > 1000000) { // 1s heartbeat
-        fprintf(stderr, "[STALL] avail=0 unacked=%zu win=%zu head_seq=%hu\n",
-                c.unacked_bytes, c.peer_win_bytes,
-                ntohs(c.s_head->pkt.seq));
-        dump_sendq(c.s_head);
-        c.last_stall_log = now;
-    }
+            struct timeval now; gettimeofday(&now, NULL);
+            if (avail == 0 && c.s_head &&
+                TV_DIFF(now, c.last_stall_log) > 1000000) { // 1s heartbeat
+                fprintf(stderr, "[STALL] avail=0 unacked=%zu win=%zu head_seq=%hu\n",
+                        c.unacked_bytes, c.peer_win_bytes,
+                        ntohs(c.s_head->pkt.seq));
+                dump_sendq(c.s_head);
+                c.last_stall_log = now;
+            }
 
-    while (avail > 0) {
-        size_t want = (avail > MAX_PAYLOAD) ? MAX_PAYLOAD : avail;
+            while (avail > 0) {
+                size_t want = (avail > MAX_PAYLOAD) ? MAX_PAYLOAD : avail;
 
-        uint8_t inbuf[MAX_PAYLOAD];
-        // only read as many bytes as we can send now
-        ssize_t r = input_p(inbuf, want);
-        if (r <= 0) break;
+                uint8_t inbuf[MAX_PAYLOAD];
+                ssize_t r = input_p(inbuf, want);   // read only what we can send now
+                if (r <= 0) break;
 
-        uint16_t chunk = (uint16_t)r;  // r <= want
-        uint16_t seq_to_use = c.my_next_seq_after_syn;
+                uint16_t chunk = (uint16_t)r;       // r <= want
+                uint16_t seq_to_use = c.my_next_seq_after_syn;
 
-        send_data(&c, inbuf, chunk, seq_to_use, c.expected_peer_seq);
-        c.my_next_seq_after_syn++;
+                send_data(&c, inbuf, chunk, seq_to_use, c.expected_peer_seq);
+                c.my_next_seq_after_syn++;
 
-        avail = (c.peer_win_bytes > c.unacked_bytes)
-                    ? (c.peer_win_bytes - c.unacked_bytes) : 0;
+                avail = (c.peer_win_bytes > c.unacked_bytes)
+                            ? (c.peer_win_bytes - c.unacked_bytes) : 0;
 
-        fprintf(stderr, "[SEND] data seq=%hu len=%hu unacked=%zu win=%zu avail=%zu\n",
-                seq_to_use, chunk, c.unacked_bytes, c.peer_win_bytes, avail);
-    }
-} else if (c.state == CLIENT_START && !c.syn_sent) {
-    send_syn(&c); c.syn_sent = true;
-}
-
-
-
+                fprintf(stderr, "[SEND] data seq=%hu len=%hu unacked=%zu win=%zu avail=%zu\n",
+                        seq_to_use, chunk, c.unacked_bytes, c.peer_win_bytes, avail);
+            }
+        } else if (c.state == CLIENT_START && !c.syn_sent) {
+            send_syn(&c); c.syn_sent = true;
+        }
 
         usleep(1000);
     }
